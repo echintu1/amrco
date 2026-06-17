@@ -1,0 +1,50 @@
+"""
+Answer extraction and scoring utilities.
+Robustly parses a model's free-text response into a letter choice A/B/C/D.
+"""
+
+import re
+from typing import Optional
+
+
+def extract_answer(response: str) -> Optional[str]:
+    """
+    Extract A/B/C/D from a model response.
+    Handles: 'A', 'A.', 'The answer is A', '(A)', 'Answer: B', etc.
+    Returns the letter or None if unparseable.
+    """
+    if not response:
+        return None
+
+    text = response.strip()
+
+    # 1. Single letter exactly
+    if len(text) == 1 and text.upper() in "ABCD":
+        return text.upper()
+
+    # 2. Leading letter followed by punctuation/space: "A." "B)" "C:"
+    m = re.match(r"^\s*\(?([A-D])[\.\):\s]", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 3. "answer is X" / "answer: X" / "the correct answer is X"
+    m = re.search(r"answer\s*(?:is|:)?\s*\(?([A-D])\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 4. First standalone A-D letter anywhere
+    m = re.search(r"\b([A-D])\b", text)
+    if m:
+        return m.group(1).upper()
+
+    # 5. First A-D character at all
+    m = re.search(r"([A-D])", text.upper())
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def is_correct(response: str, gold: str) -> bool:
+    pred = extract_answer(response)
+    return pred is not None and pred == gold.upper()

@@ -1,0 +1,192 @@
+"""
+Model API Adapters
+==================
+Unified interface for GPT-4o, Claude, Gemini, and Llama (via together.ai or local).
+Each adapter exposes a single `.complete(prompt, system, max_tokens, temperature)` method
+returning (text, latency_ms, usage_dict).
+
+All adapters are lazy-import: the SDK is only imported when the adapter is instantiated,
+so you only need to install the SDKs for the models you actually evaluate.
+"""
+
+from __future__ import annotations
+import time
+import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+
+@dataclass
+class CompletionResult:
+    text:        str
+    latency_ms:  float
+    input_tokens:  int
+    output_tokens: int
+    model:       str
+    error:       Optional[str] = None
+
+
+class BaseAdapter:
+    """Base class. Subclasses implement _call()."""
+    name = "base"
+    model_id = ""
+
+    def complete(self, prompt: str, system: str = "",
+                 max_tokens: int = 16, temperature: float = 0.0) -> CompletionResult:
+        t0 = time.perf_counter()
+        try:
+            text, in_tok, out_tok = self._call(prompt, system, max_tokens, temperature)
+            dt = (time.perf_counter() - t0) * 1000.0
+            return CompletionResult(text=text, latency_ms=dt,
+                                    input_tokens=in_tok, output_tokens=out_tok,
+                                    model=self.model_id)
+        except Exception as e:
+            dt = (time.perf_counter() - t0) * 1000.0
+            return CompletionResult(text="", latency_ms=dt, input_tokens=0,
+                                    output_tokens=0, model=self.model_id, error=str(e))
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        raise NotImplementedError
+
+
+# ── OpenAI / GPT-4o ──────────────────────────────────────────────────────────
+class OpenAIAdapter(BaseAdapter):
+    name = "gpt-4o"
+    def __init__(self, model_id: str = "gpt-4o-2024-05-13",
+                 api_key: Optional[str] = None):
+        from openai import OpenAI
+        self.model_id = model_id
+        self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        resp = self.client.chat.completions.create(
+            model=self.model_id, messages=msgs,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        text = resp.choices[0].message.content or ""
+        return text, resp.usage.prompt_tokens, resp.usage.completion_tokens
+
+
+# ── Anthropic / Claude ───────────────────────────────────────────────────────
+class AnthropicAdapter(BaseAdapter):
+    name = "claude-3-5-sonnet"
+    def __init__(self, model_id: str = "claude-3-5-sonnet-20241022",
+                 api_key: Optional[str] = None):
+        import anthropic
+        self.model_id = model_id
+        self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        resp = self.client.messages.create(
+            model=self.model_id, max_tokens=max_tokens, temperature=temperature,
+            system=system or "You are a helpful assistant.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(block.text for block in resp.content if hasattr(block, "text"))
+        return text, resp.usage.input_tokens, resp.usage.output_tokens
+
+
+# ── Google / Gemini ──────────────────────────────────────────────────────────
+class GeminiAdapter(BaseAdapter):
+    name = "gemini-1-5-pro"
+    def __init__(self, model_id: str = "gemini-1.5-pro-002",
+                 api_key: Optional[str] = None):
+        import google.generativeai as genai
+        genai.configure(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+        self.model_id = model_id
+        self._genai = genai
+        self.model = genai.GenerativeModel(model_id)
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        full_prompt = (system + "\n\n" + prompt) if system else prompt
+        resp = self.model.generate_content(
+            full_prompt,
+            generation_config=self._genai.types.GenerationConfig(
+                max_output_tokens=max_tokens, temperature=temperature,
+            ),
+        )
+        text = resp.text if hasattr(resp, "text") else ""
+        # Gemini usage metadata
+        um = getattr(resp, "usage_metadata", None)
+        in_tok  = getattr(um, "prompt_token_count", 0) if um else 0
+        out_tok = getattr(um, "candidates_token_count", 0) if um else 0
+        return text, in_tok, out_tok
+
+
+# ── Llama 3 (via Together.ai — easiest hosted option) ────────────────────────
+class TogetherLlamaAdapter(BaseAdapter):
+    name = "llama3-70b"
+    def __init__(self, model_id: str = "meta-llama/Llama-3-70b-chat-hf",
+                 api_key: Optional[str] = None):
+        from openai import OpenAI  # Together uses OpenAI-compatible API
+        self.model_id = model_id
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("TOGETHER_API_KEY"),
+            base_url="https://api.together.xyz/v1",
+        )
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        resp = self.client.chat.completions.create(
+            model=self.model_id, messages=msgs,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        text = resp.choices[0].message.content or ""
+        return text, resp.usage.prompt_tokens, resp.usage.completion_tokens
+
+
+# ── Mock adapter for --dry-run (no API calls, no cost) ───────────────────────
+class MockAdapter(BaseAdapter):
+    """
+    Returns plausible answers without any network call.
+    Used to validate the full pipeline before spending money.
+    Deterministic per-question so dry-run results are reproducible.
+    """
+    name = "mock"
+    def __init__(self, model_id: str = "mock-model", accuracy: float = 0.85, seed: int = 42):
+        import random
+        self.model_id = model_id
+        self.accuracy = accuracy
+        self._rng = random.Random(seed)
+
+    def _call(self, prompt, system, max_tokens, temperature):
+        import re
+        # Extract the answer choices from the prompt; pick correct with prob=accuracy
+        # The harness encodes the correct letter in the prompt as [CORRECT:X] only in dry-run
+        m = re.search(r"\[CORRECT:([A-D])\]", prompt)
+        correct = m.group(1) if m else "A"
+        if self._rng.random() < self.accuracy:
+            answer = correct
+        else:
+            answer = self._rng.choice([c for c in "ABCD" if c != correct])
+        time.sleep(0.001)  # simulate tiny latency
+        return answer, 120, 1
+
+
+# ── Factory ──────────────────────────────────────────────────────────────────
+ADAPTER_REGISTRY = {
+    "gpt-4o":            OpenAIAdapter,
+    "claude-3-5-sonnet": AnthropicAdapter,
+    "gemini-1-5-pro":    GeminiAdapter,
+    "llama3-70b":        TogetherLlamaAdapter,
+}
+
+
+def get_adapter(model_key: str, dry_run: bool = False, **kwargs) -> BaseAdapter:
+    if dry_run:
+        # Per-model accuracy for realistic dry-run (matches paper's calibrated values)
+        dry_acc = {
+            "gpt-4o": 0.887, "claude-3-5-sonnet": 0.881,
+            "gemini-1-5-pro": 0.864, "llama3-70b": 0.820,
+        }.get(model_key, 0.85)
+        return MockAdapter(model_id=f"mock-{model_key}", accuracy=dry_acc)
+    if model_key not in ADAPTER_REGISTRY:
+        raise ValueError(f"Unknown model '{model_key}'. Options: {list(ADAPTER_REGISTRY)}")
+    return ADAPTER_REGISTRY[model_key](**kwargs)

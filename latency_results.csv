@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+Live MMLU Evaluation Runner
+===========================
+Evaluates one or more LLMs on MMLU via their live APIs, with real latency,
+token usage, cost, and accuracy measurement. Produces a real CSV that anchors
+the paper's simulated distributions.
+
+USAGE
+-----
+# 0. Dry run first (NO API calls, NO cost) — verifies the whole pipeline:
+python run_live_mmlu.py --models gpt-4o claude-3-5-sonnet --n 100 --dry-run
+
+# 1. Real run (requires API keys in environment):
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...
+export TOGETHER_API_KEY=...          # for Llama 3 70B
+python run_live_mmlu.py --models gpt-4o claude-3-5-sonnet gemini-1-5-pro llama3-70b --n 100
+
+# 2. Single model, fewer samples (cheapest sanity check):
+python run_live_mmlu.py --models claude-3-5-sonnet --n 25
+
+OUTPUT
+------
+results/live_mmlu_raw.csv        — one row per (model, question)
+results/live_mmlu_summary.csv    — one row per model with accuracy + 95% CI
+"""
+
+import sys, os, argparse, time, csv, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+
+from adapters.model_adapters import get_adapter
+from data.mmlu_loader import load_mmlu, format_prompt, SYSTEM_PROMPT
+from data.answer_parser import extract_answer, is_correct
+
+# Pricing per 1M tokens (USD) — Q1 2025; update before final submission
+PRICING = {
+    "gpt-4o":            {"in": 5.00, "out": 15.00},
+    "claude-3-5-sonnet": {"in": 3.00, "out": 15.00},
+    "gemini-1-5-pro":    {"in": 3.50, "out": 10.50},
+    "llama3-70b":        {"in": 0.90, "out": 0.90},
+}
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+def bootstrap_ci(correct_flags, n_boot=10000, seed=42):
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(correct_flags, dtype=float)
+    boots = [rng.choice(arr, len(arr), replace=True).mean() for _ in range(n_boot)]
+    return float(arr.mean()), float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+
+
+def evaluate_model(model_key, questions, dry_run=False, max_retries=3,
+                   sleep_between=0.0, verbose=True):
+    adapter = get_adapter(model_key, dry_run=dry_run)
+    rows = []
+    if verbose:
+        mode = "DRY-RUN (no API)" if dry_run else "LIVE API"
+        print(f"\n  Evaluating {model_key}  [{mode}]  on {len(questions)} questions")
+
+    for i, q in enumerate(questions):
+        prompt = format_prompt(q, dry_run=dry_run)
+
+        # retry loop for transient API errors
+        result = None
+        for attempt in range(max_retries):
+            result = adapter.complete(prompt, system=SYSTEM_PROMPT,
+                                      max_tokens=8, temperature=0.0)
+            if result.error is None:
+                break
+            if verbose:
+                print(f"      q{i} retry {attempt+1}: {result.error[:60]}")
+            time.sleep(1.5 * (attempt + 1))
+
+        pred = extract_answer(result.text)
+        correct = int(pred == q.answer) if pred else 0
+
+        rows.append({
+            "model":        model_key,
+            "question_id":  q.id,
+            "subject":      q.subject,
+            "gold":         q.answer,
+            "predicted":    pred or "PARSE_FAIL",
+            "correct":      correct,
+            "latency_ms":   round(result.latency_ms, 1),
+            "input_tokens": result.input_tokens,
+            "output_tokens":result.output_tokens,
+            "raw_response": (result.text or "")[:80].replace("\n", " "),
+            "error":        result.error or "",
+        })
+
+        if sleep_between:
+            time.sleep(sleep_between)
+        if verbose and (i + 1) % 25 == 0:
+            acc_so_far = np.mean([r["correct"] for r in rows])
+            print(f"      {i+1}/{len(questions)} done — running acc={acc_so_far:.3f}")
+
+    return rows
+
+
+def summarize(all_rows):
+    summary = []
+    models = sorted(set(r["model"] for r in all_rows))
+    for model_key in models:
+        model_rows = [r for r in all_rows if r["model"] == model_key]
+        flags = [r["correct"] for r in model_rows]
+        mean, lo, hi = bootstrap_ci(flags)
+
+        lat = [r["latency_ms"]   for r in model_rows]
+        in_tok  = sum(r["input_tokens"]  for r in model_rows)
+        out_tok = sum(r["output_tokens"] for r in model_rows)
+        parse_fails = sum(1 for r in model_rows if r["predicted"] == "PARSE_FAIL")
+        errors      = sum(1 for r in model_rows if r["error"])
+
+        price = PRICING.get(model_key, {"in": 0, "out": 0})
+        total_cost = (in_tok * price["in"] + out_tok * price["out"]) / 1_000_000
+        cost_per_q = total_cost / max(len(model_rows), 1)
+        # weighted cost per 1M tokens at this run's actual input:output ratio
+        tot_tok = in_tok + out_tok
+        cost_1m = (total_cost / tot_tok * 1_000_000) if tot_tok else 0
+
+        summary.append({
+            "model":         model_key,
+            "n_samples":     len(model_rows),
+            "accuracy":      round(mean, 4),
+            "ci_lower":      round(lo, 4),
+            "ci_upper":      round(hi, 4),
+            "ci_width":      round(hi - lo, 4),
+            "p50_latency_ms":round(float(np.percentile(lat, 50)), 1),
+            "p90_latency_ms":round(float(np.percentile(lat, 90)), 1),
+            "input_tokens":  in_tok,
+            "output_tokens": out_tok,
+            "total_cost_usd":round(total_cost, 4),
+            "cost_per_q_usd":round(cost_per_q, 6),
+            "cost_per_1m_usd":round(cost_1m, 2),
+            "parse_failures":parse_fails,
+            "api_errors":    errors,
+        })
+    return summary
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Live MMLU evaluation for AMRCO paper")
+    ap.add_argument("--models", nargs="+", default=["gpt-4o", "claude-3-5-sonnet"],
+                    help="Models to evaluate")
+    ap.add_argument("--n", type=int, default=100, help="Number of MMLU questions")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="No API calls, no cost — validates the pipeline")
+    ap.add_argument("--data_dir", default=None,
+                    help="Path to MMLU CSVs (if not using HuggingFace)")
+    ap.add_argument("--subjects", nargs="*", default=None,
+                    help="Restrict to specific MMLU subjects")
+    ap.add_argument("--sleep", type=float, default=0.5,
+                    help="Seconds to sleep between calls (rate-limit safety; "
+                         "default 0.5 avoids most 429s on OpenAI tier-1)")
+    args = ap.parse_args()
+
+    print("=" * 64)
+    print("  AMRCO — Live MMLU Evaluation")
+    print("=" * 64)
+    print(f"  Models : {', '.join(args.models)}")
+    print(f"  N      : {args.n}")
+    print(f"  Mode   : {'DRY-RUN (no cost)' if args.dry_run else 'LIVE API'}")
+
+    # Load questions (in dry-run, fall back to a tiny built-in set if no datasets lib)
+    try:
+        questions = load_mmlu(n=args.n, data_dir=args.data_dir,
+                              subjects=args.subjects, seed=args.seed)
+    except (ImportError, FileNotFoundError) as e:
+        if args.dry_run:
+            print(f"\n  [dry-run] dataset unavailable ({e}); using built-in sample set")
+            questions = _builtin_sample(args.n, args.seed)
+        else:
+            print(f"\n  ERROR loading MMLU: {e}")
+            sys.exit(1)
+
+    print(f"  Loaded {len(questions)} questions across "
+          f"{len(set(q.subject for q in questions))} subjects\n")
+
+    all_rows = []
+    t_start = time.time()
+    for model_key in args.models:
+        rows = evaluate_model(model_key, questions, dry_run=args.dry_run,
+                              sleep_between=args.sleep)
+        all_rows.extend(rows)
+
+    elapsed = time.time() - t_start
+
+    # Write raw
+    raw_path = os.path.join(RESULTS_DIR, "live_mmlu_raw.csv")
+    with open(raw_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+        w.writeheader(); w.writerows(all_rows)
+
+    # Summarize + write
+    summary = summarize(all_rows)
+    sum_path = os.path.join(RESULTS_DIR, "live_mmlu_summary.csv")
+    with open(sum_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+        w.writeheader(); w.writerows(summary)
+
+    # Print summary
+    print("\n" + "=" * 64)
+    print("  RESULTS SUMMARY")
+    print("=" * 64)
+    print(f"  {'Model':<20}{'Acc':>7}{'95% CI':>18}{'Cost/1M':>10}{'p50ms':>8}")
+    print("  " + "-" * 60)
+    for s in summary:
+        ci = f"[{s['ci_lower']:.3f},{s['ci_upper']:.3f}]"
+        print(f"  {s['model']:<20}{s['accuracy']:>7.3f}{ci:>18}"
+              f"{'$'+str(s['cost_per_1m_usd']):>10}{s['p50_latency_ms']:>8.0f}")
+        if s["parse_failures"]:
+            print(f"      ⚠ {s['parse_failures']} parse failures, {s['api_errors']} API errors")
+
+    total_cost = sum(s["total_cost_usd"] for s in summary)
+    print("  " + "-" * 60)
+    print(f"  Total elapsed: {elapsed:.1f}s | Total API cost: ${total_cost:.4f}")
+    print(f"\n  Raw     -> {raw_path}")
+    print(f"  Summary -> {sum_path}")
+    if args.dry_run:
+        print("\n  This was a DRY RUN. No API calls were made and no cost incurred.")
+        print("  Remove --dry-run and set API keys to run live.")
+
+
+def _builtin_sample(n, seed):
+    """A tiny built-in MMLU-style sample so --dry-run works with zero dependencies."""
+    from data.mmlu_loader import MMLUQuestion
+    import random
+    base = [
+        ("elementary_mathematics", "What is 7 multiplied by 8?",
+         ["54", "56", "62", "48"], "B"),
+        ("us_history", "In which year did the American Civil War begin?",
+         ["1861", "1776", "1812", "1865"], "A"),
+        ("college_biology", "What molecule carries genetic information in most organisms?",
+         ["RNA", "Protein", "DNA", "Lipid"], "C"),
+        ("high_school_physics", "What is the SI unit of force?",
+         ["Joule", "Watt", "Pascal", "Newton"], "D"),
+        ("world_religions", "Which text is central to Islam?",
+         ["The Quran", "The Vedas", "The Torah", "The Tripitaka"], "A"),
+    ]
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        subj, ques, ch, ans = base[i % len(base)]
+        out.append(MMLUQuestion(id=f"builtin_{i:04d}", subject=subj,
+                                question=ques, choices=ch, answer=ans))
+    return out
+
+
+if __name__ == "__main__":
+    main()

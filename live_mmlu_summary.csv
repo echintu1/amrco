@@ -1,0 +1,102 @@
+# Live API Evaluation Harness
+
+This module runs a **real** MMLU evaluation against the live APIs of GPT-4o,
+Claude 3.5 Sonnet, Gemini 1.5 Pro, and Llama 3 70B. It anchors the paper's
+calibrated benchmark distributions in directly measured data — the step required
+before IEEE Access submission.
+
+## Why this exists
+
+The main paper uses calibrated statistical distributions for the full 30,000-call
+benchmark matrix (cost-prohibitive to run fully live). This harness lets you run a
+small, cheap, **real** MMLU evaluation (~$2–4, ~15 min for 100 samples × 4 models)
+and validates that the calibrated values match reality.
+
+## Step-by-step
+
+### 1. Install dependencies
+
+```bash
+cd live_eval
+pip install -r requirements.txt
+```
+
+You only need the SDK for each model you evaluate. Minimum (Claude only):
+```bash
+pip install anthropic datasets numpy
+```
+
+### 2. Dry run first (zero cost, zero API calls)
+
+Verify the whole pipeline works before spending anything:
+
+```bash
+python run_live_mmlu.py --models gpt-4o claude-3-5-sonnet gemini-1-5-pro llama3-70b --n 100 --dry-run
+```
+
+This uses a mock model — no network, no keys, no cost. Confirms parsing, scoring,
+CSV output, and statistics all work.
+
+### 3. Set API keys
+
+```bash
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...
+export TOGETHER_API_KEY=...     # Llama 3 70B is hosted via Together.ai
+```
+
+Don't have all four? Just evaluate the ones you have keys for:
+```bash
+python run_live_mmlu.py --models claude-3-5-sonnet --n 100
+```
+
+### 4. Run live
+
+```bash
+python run_live_mmlu.py \
+  --models gpt-4o claude-3-5-sonnet gemini-1-5-pro llama3-70b \
+  --n 100 --seed 42
+```
+
+Outputs:
+- `results/live_mmlu_raw.csv` — one row per (model, question) with prediction, latency, tokens
+- `results/live_mmlu_summary.csv` — per-model accuracy, 95% CI, cost, latency
+
+### 5. Generate the paper patch
+
+```bash
+python merge_live_results.py
+```
+
+This compares your live results to the paper's calibrated values and writes
+`results/paper_patch.md` containing two ready-to-paste blocks:
+- **Block 1:** A new Section V-E "Live API Validation" with Table X
+- **Block 2:** A rewritten, honest Limitation 4
+
+## Cost estimate
+
+| Models | Samples | Approx. cost | Time |
+|--------|---------|-------------|------|
+| Claude only | 100 | ~$0.50 | ~4 min |
+| All 4 | 100 | ~$2–4 | ~15 min |
+| All 4 | 500 | ~$10–20 | ~70 min |
+
+MMLU answers are 1 token each, so cost is dominated by the ~120-token question prompts.
+
+## Cheapest sanity check
+
+```bash
+python run_live_mmlu.py --models claude-3-5-sonnet --n 25
+```
+~$0.12, ~1 minute. Confirms your API key works and produces real numbers.
+
+## Notes
+
+- All runs use `temperature=0.0` and `seed=42` for reproducibility.
+- `max_tokens=8` keeps output cost negligible (we only need a letter).
+- Robust answer parsing handles "A", "A.", "The answer is A", "(A)", etc.
+- Retry logic handles transient API errors (3 attempts with backoff).
+- If a provider updated their model since the paper's calibration, the merge
+  script flags any value falling outside the live 95% CI and tells you to update
+  Table IV.
